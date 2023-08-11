@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import requests
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ from azure.core.credentials import AzureKeyCredential
 from bs4 import BeautifulSoup
 from langchain.text_splitter import MarkdownTextSplitter, RecursiveCharacterTextSplitter, PythonCodeTextSplitter
 from tqdm import tqdm
+
+import traceback
+from random import random
+import functools
+import time
 
 FILE_FORMAT_DICT = {
         "md": "markdown",
@@ -35,6 +41,33 @@ PDF_HEADERS = {
     "title": "h1",
     "sectionHeading": "h2"
 }
+
+
+def retry_with_exponential_backoff(max_retries: int = 50, delay_factor: float = 2.0, max_delay: float = 300.0, jitter: bool = True, verbose: bool = True):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries <= max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if retries == max_retries:
+                        raise e
+
+                    sleep_time = delay_factor ** retries
+                    if jitter:
+                        sleep_time = sleep_time * (0.5 + random())  # Add random jitter
+
+                    sleep_time = min(sleep_time, max_delay)
+                    if verbose:
+                        print("Exception occurred:\n", traceback.format_exc())
+                        print(f"Failed due to {e} for {func}\n. Attempting retry number {retries} after {round(sleep_time, 3)} seconds")
+                    time.sleep(sleep_time)
+                    retries += 1
+        return wrapper
+    return decorator
+
 
 @dataclass
 class Document(object):
@@ -55,6 +88,8 @@ class Document(object):
     filepath: Optional[str] = None
     url: Optional[str] = None
     metadata: Optional[Dict] = None
+    contentVector: Optional[List[float]] = None
+
 
 def cleanup_content(content: str) -> str:
     """Cleans up the given content using regexes
@@ -429,6 +464,29 @@ def merge_chunks_serially(chunked_content_list: List[str], num_tokens: int) -> G
         yield current_chunk, total_size
 
 
+@retry_with_exponential_backoff(max_retries=10, delay_factor=30)
+def get_embedding(text):
+    endpoint = os.environ.get("EMBEDDING_MODEL_ENDPOINT")
+    key = os.environ.get("EMBEDDING_MODEL_KEY")
+    if endpoint is None or key is None:
+        raise Exception("EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding")
+    
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": key
+    }
+
+    body = {
+        "input": text
+    }
+
+    response = requests.post(endpoint, headers=headers, json=body)
+    if response.status_code != 200:
+        raise Exception(f"Error getting embedding for text={text} with status_code={response.status_code} and response={response.text}")
+    response = response.json()
+    return response['data'][0]['embedding']
+
+
 def chunk_content_helper(
         content: str, file_format: str, file_name: Optional[str],
         token_overlap: int,
@@ -477,7 +535,8 @@ def chunk_content(
     token_overlap: int = 0,
     extensions_to_process = FILE_FORMAT_DICT.keys(),
     cracked_pdf = False,
-    use_layout = False
+    use_layout = False,
+    add_embeddings = False
 ) -> ChunkingResult:
     """Chunks the given content. If ignore_errors is true, returns None
         in case of an error
@@ -515,11 +574,18 @@ def chunk_content(
         skipped_chunks = 0
         for chunk, chunk_size, doc in chunked_context:
             if chunk_size >= min_chunk_size:
+                if add_embeddings:
+                    # print('getting embeddings...')
+                    doc.contentVector = get_embedding(doc.title+"\n\n"+chunk)
+                    # doc.titleVector = get_embedding(doc.title)
+
+                # print(doc)
                 chunks.append(
                     Document(
                         content=chunk,
                         title=doc.title,
                         url=url,
+                        contentVector=doc.contentVector
                     )
                 )
             else:
@@ -552,7 +618,8 @@ def chunk_file(
     token_overlap: int = 0,
     extensions_to_process = FILE_FORMAT_DICT.keys(),
     form_recognizer_client = None,
-    use_layout = False
+    use_layout = False,
+    add_embeddings=False
 ) -> ChunkingResult:
     """Chunks the given file.
     Args:
@@ -589,7 +656,8 @@ def chunk_file(
         token_overlap=max(0, token_overlap),
         extensions_to_process=extensions_to_process,
         cracked_pdf=cracked_pdf,
-        use_layout=use_layout
+        use_layout=use_layout,
+        add_embeddings=add_embeddings
     )
 
 
@@ -603,7 +671,8 @@ def process_file(
         token_overlap: int = 0,
         extensions_to_process: List[str] = FILE_FORMAT_DICT.keys(),
         form_recognizer_client = None,
-        use_layout = False
+        use_layout = False,
+        add_embeddings = False
     ):
 
     if not form_recognizer_client:
@@ -626,7 +695,8 @@ def process_file(
             token_overlap=token_overlap,
             extensions_to_process=extensions_to_process,
             form_recognizer_client=form_recognizer_client,
-            use_layout=use_layout
+            use_layout=use_layout,
+            add_embeddings=add_embeddings
         )
         for chunk_idx, chunk_doc in enumerate(result.chunks):
             chunk_doc.filepath = rel_file_path
@@ -650,7 +720,8 @@ def chunk_directory(
         extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
         form_recognizer_client = None,
         use_layout = False,
-        njobs=4
+        njobs=4,
+        add_embeddings = False
 ):
     """
     Chunks the given directory recursively
@@ -666,6 +737,7 @@ def chunk_directory(
         extensions_to_process (List[str]): The list of extensions to process. 
         form_recognizer_client: Optional form recognizer client to use for pdf files.
         use_layout (bool): If true, uses Layout model for pdf files. Otherwise, uses Read.
+        add_embeddings (bool): If true, adds a vector embedding to each chunk using the embedding model endpoint and key.
 
     Returns:
         List[Document]: List of chunked documents.
@@ -690,7 +762,7 @@ def chunk_directory(
                                        min_chunk_size=min_chunk_size, url_prefix=url_prefix,
                                        token_overlap=token_overlap,
                                        extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=form_recognizer_client, use_layout=use_layout)
+                                       form_recognizer_client=form_recognizer_client, use_layout=use_layout, add_embeddings=add_embeddings)
             if is_error:
                 num_files_with_errors += 1
                 continue
@@ -705,7 +777,7 @@ def chunk_directory(
                                        min_chunk_size=min_chunk_size, url_prefix=url_prefix,
                                        token_overlap=token_overlap,
                                        extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=None, use_layout=use_layout)
+                                       form_recognizer_client=None, use_layout=use_layout, add_embeddings=add_embeddings)
         with ProcessPoolExecutor(max_workers=njobs) as executor:
             futures = list(tqdm(executor.map(process_file_partial, files_to_process), total=len(files_to_process)))
             for result, is_error in futures:
@@ -748,3 +820,5 @@ class SingletonFormRecognizerClient:
     def __setstate__(self, state):
         url, key = state
         self.instance = DocumentAnalysisClient(endpoint=url, credential=AzureKeyCredential(key))
+
+
